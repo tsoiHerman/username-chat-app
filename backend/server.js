@@ -1,38 +1,41 @@
-import express from 'express';
-import http from 'http';
-import { Server } from 'socket.io';
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
 
-let onlineUsers = {}; // username -> socket.id
+const io = new Server(server, {
+  cors: {
+    origin: [
+      "https://username-chat-frontend.vercel.app", // your Vercel URL
+      "http://localhost:5173"                     // for local dev
+    ],
+    methods: ["GET", "POST"]
+  },
+  transports: ["websocket", "polling"], // ensure WebSocket transport
+});
 
-io.on('connection', (socket) => {
+const users = new Map();
+
+io.on("connection", (socket) => {
   const { username } = socket.handshake.auth;
   if (!username) return;
 
-  onlineUsers[username] = socket.id;
+  users.set(username, socket.id);
+  io.emit("users", Array.from(users.keys()));
 
-  // send updated user list to everyone
-  io.emit('users', Object.keys(onlineUsers));
-
-  socket.on('private_message', ({ to, content }) => {
-    const targetSocketId = onlineUsers[to];
-    if (targetSocketId) {
-      io.to(targetSocketId).emit('message', {
-        id: Date.now(),
-        sender: username,
-        content,
-        timestamp: Date.now(),
-      });
-    }
+  socket.on("private_message", (msg) => {
+    const recipientSocketId = users.get(msg.to);
+    if (recipientSocketId) io.to(recipientSocketId).emit("message", msg);
+    socket.emit("message", msg);
   });
 
-  socket.on('disconnect', () => {
-    delete onlineUsers[username];
-    io.emit('users', Object.keys(onlineUsers));
+  socket.on("disconnect", () => {
+    users.delete(username);
+    io.emit("users", Array.from(users.keys()));
   });
 });
 
-server.listen(4000, () => console.log("Server listening on port 4000"));
+const PORT = process.env.PORT || 4000;
+server.listen(PORT, () => console.log("Server running on port", PORT));
