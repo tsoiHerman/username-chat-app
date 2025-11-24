@@ -11,9 +11,50 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #define WIDTH 640
 #define HEIGHT 480
+
+// ============================================================
+// ====================== FRAME SAVING =========================
+// ============================================================
+
+void ensureFramesFolder() {
+#if defined(_WIN32)
+    _mkdir("frames");
+#else
+    mkdir("frames", 0777);
+#endif
+}
+
+void saveFramePNG(DrawingWindow &window, int frameNumber) {
+    std::string num = std::to_string(frameNumber);
+    num = std::string(5 - num.length(), '0') + num;  // zero pad
+    std::string filename = "frames/frame_" + num + ".png";
+
+    SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(
+        0, WIDTH, HEIGHT, 32, SDL_PIXELFORMAT_ARGB8888
+    );
+
+    uint32_t* pixels = (uint32_t*)surf->pixels;
+
+    for (int y = 0; y < HEIGHT; y++)
+        for (int x = 0; x < WIDTH; x++)
+            pixels[y * WIDTH + x] = window.getPixelColour(x, y);
+
+    if (IMG_SavePNG(surf, filename.c_str()) != 0)
+        std::cerr << "Failed to save PNG: " << IMG_GetError() << "\n";
+    else
+        std::cout << "Saved " << filename << "\n";
+
+    SDL_FreeSurface(surf);
+}
+
+// ============================================================
+// ==================== YOUR ORIGINAL CODE =====================
+// ============================================================
 
 struct Material {
     glm::vec3 Kd{1.0f,1.0f,1.0f};
@@ -25,24 +66,20 @@ struct Model {
     std::vector<std::array<int,3>> faces;
     std::vector<std::string> faceMaterials;
     std::map<std::string,Material> materials;
-    std::map<int, std::array<glm::vec2,3>> faceUVs; // UVs per face
+    std::map<int, std::array<glm::vec2,3>> faceUVs;
 };
 
-// ------------------- Global view -------------------
 float scale = 1.0f;
 glm::vec2 panOffset(0.0f,0.0f);
 float tiltOffset = 0.0f;
 float orbitX = 0.0f;
 float orbitY = 0.0f;
 
-// ------------------- Lighting -------------------
 glm::vec3 lightPos(0.0f,6.4f,1.0f);
 float ambientLight = 0.2f;
 
-// ------------------- Z-buffer -------------------
 std::vector<float> zBuffer(WIDTH*HEIGHT, -1e10f);
 
-// ------------------- Texture -------------------
 SDL_Surface* floorTexture = nullptr;
 
 bool loadTexture(const std::string &path){
@@ -57,7 +94,7 @@ bool loadTexture(const std::string &path){
     return true;
 }
 
-// ------------------- OBJ / MTL -------------------
+// ---------- load MTL ----------
 std::map<std::string,Material> loadMTL(const std::string &filename){
     std::map<std::string,Material> materials;
     std::ifstream file(filename);
@@ -73,14 +110,16 @@ std::map<std::string,Material> loadMTL(const std::string &filename){
     return materials;
 }
 
+// ---------- load OBJ ----------
 Model loadOBJ(const std::string &filename){
     Model model;
     std::ifstream file(filename);
     if(!file.is_open()){ std::cerr << "Failed to open OBJ: " << filename << std::endl; exit(1); }
     std::string line, currentMaterial;
+
     auto normalizeUV = [](float x,float z){
-        float u = (x+3.0f)/6.0f; // floor spans x [-3,3]
-        float v = (z+2.0f)/6.0f; // floor spans z [-2,4]
+        float u = (x+3.0f)/6.0f;
+        float v = (z+2.0f)/6.0f;
         return glm::vec2(u,v);
     };
 
@@ -103,9 +142,11 @@ Model loadOBJ(const std::string &filename){
                 glm::vec3 v0=model.vertices[f[0]-1];
                 glm::vec3 v1=model.vertices[f[1]-1];
                 glm::vec3 v2=model.vertices[f[2]-1];
-                model.faceUVs[model.faces.size()-1]={{normalizeUV(v0.x,v0.z),
-                                                     normalizeUV(v1.x,v1.z),
-                                                     normalizeUV(v2.x,v2.z)}};
+                model.faceUVs[model.faces.size()-1]={
+                    { normalizeUV(v0.x,v0.z),
+                      normalizeUV(v1.x,v1.z),
+                      normalizeUV(v2.x,v2.z) }
+                };
             }
         }
         else if(line.substr(0,6)=="mtllib"){
@@ -117,7 +158,6 @@ Model loadOBJ(const std::string &filename){
     return model;
 }
 
-// ------------------- Projection -------------------
 glm::vec2 project(const glm::vec3 &v){
     glm::mat4 rot = glm::rotate(glm::mat4(1.0f), orbitX, glm::vec3(0,1,0));
     rot = glm::rotate(rot, orbitY, glm::vec3(1,0,0));
@@ -126,7 +166,6 @@ glm::vec2 project(const glm::vec3 &v){
                      -pv.y*scale + HEIGHT/2.0f + panOffset.y + tiltOffset);
 }
 
-// ------------------- Rasterization -------------------
 glm::vec3 barycentric(const glm::vec2 &p,const glm::vec2 &a,const glm::vec2 &b,const glm::vec2 &c){
     float det = (b.y-c.y)*(a.x-c.x) + (c.x-b.x)*(a.y-c.y);
     float w1 = ((b.y-c.y)*(p.x-c.x) + (c.x-b.x)*(p.y-c.y))/det;
@@ -141,11 +180,14 @@ glm::vec3 faceNormal(const glm::vec3 &v0,const glm::vec3 &v1,const glm::vec3 &v2
 
 glm::vec3 sampleTexture(int faceIndex,const glm::vec3 &bc,const Model &model){
     if(floorTexture==nullptr) return glm::vec3(1.0f,1.0f,1.0f);
+
     auto &uvs = model.faceUVs.at(faceIndex);
     float u = bc.x*uvs[0].x + bc.y*uvs[1].x + bc.z*uvs[2].x;
     float v = bc.x*uvs[0].y + bc.y*uvs[1].y + bc.z*uvs[2].y;
+
     u = std::clamp(u,0.0f,1.0f);
     v = std::clamp(v,0.0f,1.0f);
+
     int texX = int(u*(floorTexture->w-1));
     int texY = int((1.0f-v)*(floorTexture->h-1));
 
@@ -180,14 +222,21 @@ void drawTriangle(DrawingWindow &window,int faceIndex,const glm::vec3 &v0,const 
                 int idx = y*WIDTH + x;
                 if(z>zBuffer[idx]){
                     zBuffer[idx]=z;
+
                     glm::vec3 color;
                     if(model.faceMaterials[faceIndex]=="Floor")
                         color = sampleTexture(faceIndex, bc, model);
                     else{
                         float diffuse = std::max(0.0f, glm::dot(n, glm::normalize(lightPos-(v0+v1+v2)/3.0f)));
-                        color = model.materials.at(model.faceMaterials[faceIndex]).Kd * (ambientLight + (1.0f-ambientLight)*diffuse);
+                        color = model.materials.at(model.faceMaterials[faceIndex]).Kd *
+                            (ambientLight + (1.0f-ambientLight)*diffuse);
                     }
-                    uint32_t c = (255<<24) | (uint32_t(color.r*255)<<16) | (uint32_t(color.g*255)<<8) | uint32_t(color.b*255);
+
+                    uint32_t c = (255<<24)
+                                 | (uint32_t(color.r*255)<<16)
+                                 | (uint32_t(color.g*255)<<8)
+                                 | uint32_t(color.b*255);
+
                     window.setPixelColour(x,y,c);
                 }
             }
@@ -198,17 +247,22 @@ void drawTriangle(DrawingWindow &window,int faceIndex,const glm::vec3 &v0,const 
 void drawModel(DrawingWindow &window,const Model &model){
     for(size_t i=0;i<model.faces.size();i++){
         const auto &f = model.faces[i];
-        glm::vec3 v[3];
-        for(int j=0;j<3;j++) v[j] = model.vertices[f[j]-1];
+        glm::vec3 v[3] = {
+            model.vertices[f[0]-1],
+            model.vertices[f[1]-1],
+            model.vertices[f[2]-1]
+        };
         drawTriangle(window,i,v[0],v[1],v[2],model);
     }
 }
 
-// ------------------- Bounding box -------------------
 void computeBoundingBox(const Model &model, glm::vec3 &minV, glm::vec3 &maxV){
     if(model.vertices.empty()) return;
     minV=maxV=model.vertices[0];
-    for(const auto &v:model.vertices){ minV=glm::min(minV,v); maxV=glm::max(maxV,v);}
+    for(const auto &v:model.vertices){
+        minV = glm::min(minV,v);
+        maxV = glm::max(maxV,v);
+    }
 }
 
 void centerModel(Model &model){
@@ -216,20 +270,19 @@ void centerModel(Model &model){
     computeBoundingBox(model,minV,maxV);
     glm::vec3 center = (minV+maxV)*0.5f;
     for(auto &v:model.vertices) v -= center;
+
     glm::vec3 size = maxV-minV;
     float scaleX = (WIDTH-40)/size.x;
     float scaleY = (HEIGHT-40)/size.y;
     scale = std::min(scaleX,scaleY);
 }
 
-// ------------------- Draw -------------------
 void draw(DrawingWindow &window,const Model &model){
     window.clearPixels();
     std::fill(zBuffer.begin(), zBuffer.end(), -1e10f);
     drawModel(window,model);
 }
 
-// ------------------- Event -------------------
 void handleEvent(SDL_Event event){
     if(event.type==SDL_KEYDOWN){
         switch(event.key.keysym.sym){
@@ -239,30 +292,57 @@ void handleEvent(SDL_Event event){
             case SDLK_d: panOffset.x += 10.0f; break;
             case SDLK_q: tiltOffset += 10.0f; break;
             case SDLK_e: tiltOffset -= 10.0f; break;
-            case SDLK_LEFT: orbitX -= 0.1f; break;
+            case SDLK_LEFT:  orbitX -= 0.1f; break;
             case SDLK_RIGHT: orbitX += 0.1f; break;
-            case SDLK_UP: orbitY += 0.1f; break;
-            case SDLK_DOWN: orbitY -= 0.1f; break;
+            case SDLK_UP:    orbitY += 0.1f; break;
+            case SDLK_DOWN:  orbitY -= 0.1f; break;
         }
     }
 }
 
-// ------------------- Main -------------------
+// ============================================================
+// ========================= MAIN ==============================
+// ============================================================
+
 int main(int argc,char *argv[]){
-    if(SDL_Init(SDL_INIT_VIDEO)!=0){ std::cerr<<"SDL Init Failed"<<std::endl; return -1; }
-    if(!(IMG_Init(IMG_INIT_PNG)&IMG_INIT_PNG)){ std::cerr<<"SDL_image Init Failed"<<std::endl; return -1; }
+    if(SDL_Init(SDL_INIT_VIDEO)!=0){
+        std::cerr<<"SDL Init Failed"<<std::endl;
+        return -1;
+    }
+    if(!(IMG_Init(IMG_INIT_PNG)&IMG_INIT_PNG)){
+        std::cerr<<"SDL_image Init Failed"<<std::endl;
+        return -1;
+    }
 
     DrawingWindow window(WIDTH,HEIGHT,false);
     SDL_Event event;
 
-    if(!loadTexture("box/ground.png")) return -1;
+    if(!loadTexture("box/ground.png"))
+        return -1;
 
     Model box = loadOBJ("box/box.obj");
     centerModel(box);
 
+    ensureFramesFolder();
+    int frameCounter = 0;
+
+    Uint64 lastTime = SDL_GetPerformanceCounter();
+    double targetFrame = 1.0 / 30.0;
+
     while(true){
-        if(window.pollForInputEvents(event)) handleEvent(event);
-        draw(window,box);
-        window.renderFrame();
+        while(window.pollForInputEvents(event))
+            handleEvent(event);
+
+        Uint64 now = SDL_GetPerformanceCounter();
+        double dt = double(now - lastTime) / SDL_GetPerformanceFrequency();
+
+        if(dt >= targetFrame){
+            lastTime = now;
+
+            draw(window,box);
+            window.renderFrame();
+
+            saveFramePNG(window, frameCounter++);
+        }
     }
 }
