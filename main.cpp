@@ -15,7 +15,7 @@
 #define HEIGHT 480
 
 struct Material {
-    glm::vec3 Kd{1.0f,1.0f,1.0f}; // diffuse color
+    glm::vec3 Kd{1.0f,1.0f,1.0f};
 };
 
 struct Model {
@@ -25,14 +25,21 @@ struct Model {
     std::map<std::string,Material> materials;
 };
 
-// Global view control
+// ------------------- Global view -------------------
 float scale = 1.0f;
 glm::vec2 panOffset(0.0f,0.0f);
 float tiltOffset = 0.0f;
 float orbitX = 0.0f;
 float orbitY = 0.0f;
 
-// Load MTL
+// ------------------- Lighting -------------------
+glm::vec3 lightPos(0.0f, 6.4f, 1.0f);  // ceiling light
+float ambientLight = 0.2f;
+
+// ------------------- Z-buffer -------------------
+std::vector<float> zBuffer(WIDTH*HEIGHT, -1e10f);
+
+// ------------------- OBJ / MTL loading -------------------
 std::map<std::string,Material> loadMTL(const std::string &filename){
     std::map<std::string,Material> materials;
     std::ifstream file(filename);
@@ -48,7 +55,6 @@ std::map<std::string,Material> loadMTL(const std::string &filename){
     return materials;
 }
 
-// Load OBJ
 Model loadOBJ(const std::string &filename){
     Model model;
     std::ifstream file(filename);
@@ -77,7 +83,7 @@ Model loadOBJ(const std::string &filename){
     return model;
 }
 
-// Project 3D point to 2D
+// ------------------- Projection -------------------
 glm::vec2 project(const glm::vec3 &v){
     glm::mat4 rot = glm::rotate(glm::mat4(1.0f), orbitX, glm::vec3(0,1,0));
     rot = glm::rotate(rot, orbitY, glm::vec3(1,0,0));
@@ -86,45 +92,76 @@ glm::vec2 project(const glm::vec3 &v){
                      -pv.y*scale + HEIGHT/2.0f + panOffset.y + tiltOffset);
 }
 
-// Simple wireframe draw for a triangle
-void drawTriangle(DrawingWindow &window, const glm::vec2 &p0, const glm::vec2 &p1, const glm::vec2 &p2, const glm::vec3 &color){
-    uint32_t c = (255<<24) | (uint32_t(color.r*255)<<16) | (uint32_t(color.g*255)<<8) | uint32_t(color.b*255);
-
-    auto drawLine = [&](const glm::vec2 &a, const glm::vec2 &b){
-        int x0=int(a.x), y0=int(a.y), x1=int(b.x), y1=int(b.y);
-        int dx=abs(x1-x0), dy=abs(y1-y0);
-        int sx=x0<x1?1:-1, sy=y0<y1?1:-1;
-        int err=dx-dy;
-        while(true){
-            if(x0>=0 && x0<window.width && y0>=0 && y0<window.height) window.setPixelColour(x0,y0,c);
-            if(x0==x1 && y0==y1) break;
-            int e2 = 2*err;
-            if(e2>-dy){ err-=dy; x0+=sx; }
-            if(e2<dx){ err+=dx; y0+=sy; }
-        }
-    };
-
-    drawLine(p0,p1);
-    drawLine(p1,p2);
-    drawLine(p2,p0);
+// ------------------- Rasterization -------------------
+glm::vec3 barycentric(const glm::vec2 &p, const glm::vec2 &a, const glm::vec2 &b, const glm::vec2 &c){
+    float det = (b.y-c.y)*(a.x-c.x) + (c.x-b.x)*(a.y-c.y);
+    float w1 = ((b.y-c.y)*(p.x-c.x) + (c.x-b.x)*(p.y-c.y)) / det;
+    float w2 = ((c.y-a.y)*(p.x-c.x) + (a.x-c.x)*(p.y-c.y)) / det;
+    float w3 = 1.0f - w1 - w2;
+    return glm::vec3(w1,w2,w3);
 }
 
-// Draw model using flat shading (just edges for now)
+glm::vec3 faceNormal(const glm::vec3 &v0,const glm::vec3 &v1,const glm::vec3 &v2){
+    return glm::normalize(glm::cross(v1-v0,v2-v0));
+}
+
+void drawTriangleFlat(DrawingWindow &window,
+                      const glm::vec3 &v0,const glm::vec3 &v1,const glm::vec3 &v2,
+                      const glm::vec3 &color){
+    glm::vec2 p0 = project(v0);
+    glm::vec2 p1 = project(v1);
+    glm::vec2 p2 = project(v2);
+
+    int minX = std::floor(std::min({p0.x,p1.x,p2.x}));
+    int maxX = std::ceil (std::max({p0.x,p1.x,p2.x}));
+    int minY = std::floor(std::min({p0.y,p1.y,p2.y}));
+    int maxY = std::ceil (std::max({p0.y,p1.y,p2.y}));
+
+    minX = std::max(0,minX); maxX = std::min(WIDTH-1,maxX);
+    minY = std::max(0,minY); maxY = std::min(HEIGHT-1,maxY);
+
+    glm::vec3 n = faceNormal(v0,v1,v2);
+
+    // Light vector (point light)
+    glm::vec3 lightVec = glm::normalize(lightPos - (v0+v1+v2)/3.0f);
+    float diffuse = std::max(0.0f, glm::dot(n, lightVec));
+    float intensity = ambientLight + (1.0f - ambientLight) * diffuse;
+
+    glm::vec3 shadedColor = color * intensity;
+
+    uint32_t c = (255<<24) | (uint32_t(shadedColor.r*255)<<16) |
+                 (uint32_t(shadedColor.g*255)<<8) | uint32_t(shadedColor.b*255);
+
+    for(int y=minY;y<=maxY;y++){
+        for(int x=minX;x<=maxX;x++){
+            glm::vec3 bc = barycentric(glm::vec2(x+0.5f,y+0.5f),p0,p1,p2);
+            if(bc.x >= 0 && bc.y >= 0 && bc.z >= 0){
+                float z = bc.x*v0.z + bc.y*v1.z + bc.z*v2.z;
+                int idx = y*WIDTH + x;
+                if(z > zBuffer[idx]){
+                    zBuffer[idx] = z;
+                    window.setPixelColour(x,y,c);
+                }
+            }
+        }
+    }
+}
+
 void drawModelFlat(DrawingWindow &window, const Model &model){
     for(size_t i=0;i<model.faces.size();i++){
         const auto &f = model.faces[i];
-        glm::vec2 pts[3];
-        for(int j=0;j<3;j++) pts[j] = project(model.vertices[f[j]-1]);
+        glm::vec3 v[3];
+        for(int j=0;j<3;j++) v[j] = model.vertices[f[j]-1];
 
         glm::vec3 kd(1.0f,1.0f,1.0f);
         auto it = model.materials.find(model.faceMaterials[i]);
         if(it!=model.materials.end()) kd = it->second.Kd;
 
-        drawTriangle(window, pts[0], pts[1], pts[2], kd);
+        drawTriangleFlat(window,v[0],v[1],v[2],kd);
     }
 }
 
-// Bounding box
+// ------------------- Bounding box & centering -------------------
 void computeBoundingBox(const Model &model, glm::vec3 &minV, glm::vec3 &maxV){
     if(model.vertices.empty()) return;
     minV = maxV = model.vertices[0];
@@ -134,7 +171,6 @@ void computeBoundingBox(const Model &model, glm::vec3 &minV, glm::vec3 &maxV){
     }
 }
 
-// Center model and auto-fit scale
 void centerModel(Model &model){
     glm::vec3 minV,maxV;
     computeBoundingBox(model,minV,maxV);
@@ -147,13 +183,14 @@ void centerModel(Model &model){
     scale = std::min(scaleX, scaleY);
 }
 
-// Draw model
-void draw(DrawingWindow &window, const Model &model){
+// ------------------- Draw -------------------
+void draw(DrawingWindow &window,const Model &model){
     window.clearPixels();
+    std::fill(zBuffer.begin(), zBuffer.end(), -1e10f);
     drawModelFlat(window,model);
 }
 
-// Event handling
+// ------------------- Event handling -------------------
 void handleEvent(SDL_Event event){
     if(event.type==SDL_KEYDOWN){
         switch(event.key.keysym.sym){
@@ -171,6 +208,7 @@ void handleEvent(SDL_Event event){
     }
 }
 
+// ------------------- Main -------------------
 int main(int argc,char *argv[]){
     DrawingWindow window(WIDTH,HEIGHT,false);
     SDL_Event event;
